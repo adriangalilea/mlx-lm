@@ -235,12 +235,14 @@ class HyperConnection(nn.Module):
         z = mx.fast.rms_norm(y.flatten(-2), None, self.norm_eps)
         mixes = z @ self.fn.T
 
-        use_ops = (
-            self.training
-            or mx.default_device() != mx.gpu
-            or not mx.metal.is_available()
-        )
-        hc_func = _hc_ops if use_ops else _hc_kernel
+        # _hc_sinkhorn_collapse_kernel is a metal_kernel built at module-load on
+        # the main thread. Its underlying Stream(gpu, 1) is thread-local; when
+        # inference runs in a worker thread (vllm-mlx asyncio.to_thread, mlx-lm
+        # server worker, etc.) the kernel raises:
+        #   RuntimeError: There is no Stream(gpu, 1) in current thread
+        # Per adurham PR #1192 review the unfused _hc_ops path is ~16% faster
+        # on M3 Ultra anyway, so we always take it.
+        hc_func = _hc_ops
 
         return hc_func(
             x,
