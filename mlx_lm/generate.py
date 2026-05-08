@@ -224,8 +224,19 @@ def setup_arg_parser():
     return parser
 
 
-# A stream on the default device just for generation
-generation_stream = mx.new_thread_local_stream(mx.default_device())
+# A stream on the default device just for generation.
+#
+# Upstream uses mx.new_thread_local_stream which binds the stream to the thread
+# that imports this module (typically the main thread). When inference runs in
+# a worker thread (vllm-mlx asyncio.to_thread, threaded server loops, etc.) any
+# operation under `with mx.stream(generation_stream)` fails with
+#   RuntimeError: There is no Stream(gpu, N) in current thread
+# because that stream identity is not registered in the worker thread.
+#
+# mx.default_stream returns the per-thread default stream, which is a no-op
+# context that just keeps ops on the device's main queue. We lose the parallel-
+# stream pipelining optimization but gain correctness across threads.
+generation_stream = mx.default_stream(mx.default_device())
 
 
 @contextlib.contextmanager
