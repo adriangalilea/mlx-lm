@@ -224,19 +224,39 @@ def setup_arg_parser():
     return parser
 
 
-# A stream on the default device just for generation.
+# Per-thread generation stream.
 #
-# Upstream uses mx.new_thread_local_stream which binds the stream to the thread
-# that imports this module (typically the main thread). When inference runs in
-# a worker thread (vllm-mlx asyncio.to_thread, threaded server loops, etc.) any
-# operation under `with mx.stream(generation_stream)` fails with
-#   RuntimeError: There is no Stream(gpu, N) in current thread
-# because that stream identity is not registered in the worker thread.
+# Upstream uses `generation_stream = mx.new_thread_local_stream(mx.default_device())`
+# at module import. The resulting Stream is bound to the importing thread
+# (almost always the main thread). When inference is dispatched onto a worker
+# thread (vllm-mlx asyncio.to_thread, threaded HTTP servers, asyncio
+# executors, etc.) any operation under `with mx.stream(generation_stream)`
+# fails with `RuntimeError: There is no Stream(gpu, N) in current thread`.
 #
-# mx.default_stream returns the per-thread default stream, which is a no-op
-# context that just keeps ops on the device's main queue. We lose the parallel-
-# stream pipelining optimization but gain correctness across threads.
-generation_stream = mx.default_stream(mx.default_device())
+# `mx.default_stream(device)` is no better — it still returns a globally-
+# identified Stream bound to whichever thread first asked. The only correct
+# pattern is to allocate the stream lazily on first use *in the calling
+# thread* and remember it via threading.local. All call sites below use
+# `_get_generation_stream()` instead of the module-level `generation_stream`.
+import threading as _threading
+_generation_tls = _threading.local()
+
+
+def _get_generation_stream() -> mx.Stream:
+    s = getattr(_generation_tls, "stream", None)
+    if s is None:
+        s = mx.new_stream(mx.default_device())
+        _generation_tls.stream = s
+    return s
+
+
+# Kept for backwards compatibility with code that does
+# `from mlx_lm.generate import generation_stream`. Importers on other threads
+# should call `_get_generation_stream()` instead. vllm-mlx's
+# bind_generation_streams overwrites this attribute per-thread; that path
+# still works because every use site here reads via the function, not the
+# module global.
+generation_stream = mx.new_stream(mx.default_device())
 
 
 @contextlib.contextmanager
@@ -409,7 +429,7 @@ def generate_step(
     def _step(input_tokens: mx.array, input_embeddings: Optional[mx.array] = None):
         nonlocal tokens
 
-        with mx.stream(generation_stream):
+        with mx.stream(_get_generation_stream()):
             logits = _model_call(
                 input_tokens=input_tokens[None],
                 input_embeddings=(
@@ -434,7 +454,7 @@ def generate_step(
             sampled = sampler(logprobs)
             return sampled, logprobs.squeeze(0)
 
-    with mx.stream(generation_stream):
+    with mx.stream(_get_generation_stream()):
         total_prompt_tokens = (
             len(input_embeddings) if input_embeddings is not None else len(prompt)
         )
@@ -564,7 +584,7 @@ def speculative_generate_step(
         return y, logprobs
 
     def _step(model, cache, y, n_predict=1):
-        with mx.stream(generation_stream):
+        with mx.stream(_get_generation_stream()):
             logits = model(y[None], cache=cache)
             logits = logits[:, -n_predict:, :]
 
@@ -613,7 +633,7 @@ def speculative_generate_step(
             ys.append(y)
         return mx.concatenate(ys)
 
-    with mx.stream(generation_stream):
+    with mx.stream(_get_generation_stream()):
         draft_y = _prefill(draft_model, draft_cache, y)
         y = _prefill(model, model_cache, y)
 
@@ -724,7 +744,7 @@ def stream_generate(
         token_generator = speculative_generate_step(
             prompt, model, draft_model, **kwargs
         )
-    with wired_limit(model, [generation_stream]):
+    with wired_limit(model, [_get_generation_stream()]):
         tic = time.perf_counter()
         for n, (token, logprobs, from_draft) in enumerate(token_generator):
             if n == 0:
@@ -1535,7 +1555,7 @@ class BatchGenerator:
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
         self.max_kv_size = max_kv_size
 
-        self._stream = stream or generation_stream
+        self._stream = stream or _get_generation_stream()
 
         self._default_state_machine = SequenceStateMachine(
             {"normal": [(seq, None) for seq in stop_tokens]} if stop_tokens else {},
